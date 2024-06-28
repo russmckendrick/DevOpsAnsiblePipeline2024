@@ -1,0 +1,212 @@
+# kics-scan disable=3e2d3b2f-c22a-4df1-9cc6-a7a0aebb0c99
+
+# Define the trigger for the pipeline
+trigger:
+  - main
+
+# Define variables used throughout the pipeline
+variables:
+  - group: playbook  # Reference to a variable group
+  - name: PATH_COLLECTION
+    value: /home/vsts/.ansible/collections/ansible_collections/azure/azcollection
+  - name: PATH_VENV
+    value: $(Pipeline.Workspace)/venv
+  - name: REQUIREMENTS_FILE_NAME
+    value: requirements.txt
+  - name: CACHE_VERSION
+    value: v01
+
+# Specify the agent pool to use    
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+  # Stage 1: Security Scan
+  - stage: "scan"
+    displayName: "KICS - Scan Ansible Playbook"
+    jobs: 
+      - job: "kics_scan"
+        displayName: "Run KICS Scan"
+        pool:
+          vmImage: "ubuntu-latest"
+        container: checkmarx/kics:debian  # Use KICS Docker image
+        steps:
+          # Run KICS scan and publish results
+          - script: |
+              mkdir -p $(System.DefaultWorkingDirectory)/output
+              /app/bin/kics scan --ci -p ${PWD} -o ${PWD} --report-formats "all" --ignore-on-exit results
+              mv results* $(System.DefaultWorkingDirectory)/output
+              ls -lhat $(System.DefaultWorkingDirectory)/output
+          - task: PublishBuildArtifacts@1
+            inputs:
+              pathToPublish: $(System.DefaultWorkingDirectory)/output
+              artifactName: CodeAnalysisLogs
+
+  # Stage 2: Parse Scan Results
+  - stage: "scan_parse"
+    displayName: "KICS - Parse Scan Results"
+    jobs: 
+      - job: "kics_scan_parse_result"
+        displayName: "Check KICS Scan Results"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:           
+          # Download scan results
+          - task: DownloadPipelineArtifact@2
+            displayName: "Download the Security Scan Artifact Result"
+            inputs:
+              artifact: CodeAnalysisLogs
+
+          # Parse scan results and set deployment flag
+          - task: Bash@3
+            name: "setvar"
+            displayName: "Check for issues in the scan result"
+            inputs:
+                failOnStderr: true
+                targetType: "inline"
+                script: |
+                  resultsFilePath="$(Pipeline.Workspace)/results.json"
+                  BREAK=$(breakSeverity)
+                  echo "Checking for severity level: $BREAK"
+                  noIssues=$(jq --arg BREAK "$BREAK" '.severity_counters[$BREAK] // 0' $resultsFilePath)
+                  echo "Number of issues found: $noIssues"
+                  echo "##[group]Checking the scan output"
+                  if [ "$noIssues" -lt 1 ]; then
+                      echo "##vso[task.setvariable variable=OK_TO_DEPLOY;isOutput=true]true"
+                      echo "##vso[task.logissue type=warning]No issue found. Progressing with pipeline."
+                  else
+                      echo "##vso[task.setvariable variable=OK_TO_DEPLOY;isOutput=true]false"
+                      echo "##vso[task.logissue type=error]Pipeline failed due to $noIssues issue(s) found."
+                  fi
+                  echo "##[endgroup]"
+
+  # Stage 3: Run Ansible
+  - stage: "run_ansible"
+    displayName: "Run Ansible"
+    # Only run this stage if previous stages succeeded and no critical issues were found
+    condition: |
+      and
+        (
+          succeeded(),
+          eq(dependencies.scan_parse.outputs['kics_scan_parse_result.setvar.OK_TO_DEPLOY'], 'true')
+        ) 
+    jobs: 
+      - job: "ansible_install"
+        displayName: "Ansible"
+        steps:
+          # Set up Azure CLI credentials
+          - task: AzureCLI@2
+            displayName: 'Azure CLI'
+            inputs:
+              azureSubscription: '$(subscriptionName)'
+              addSpnToEnvironment: true
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                echo "##vso[task.setvariable variable=ARM_SUBSCRIPTION_ID]$(az account show --query="id" -o tsv)"
+                echo "##vso[task.setvariable variable=ARM_CLIENT_ID]${servicePrincipalId}"
+                echo "##vso[task.setvariable variable=ARM_CLIENT_SECRET]${servicePrincipalKey}"
+                echo "##vso[task.setvariable variable=ARM_TENANT_ID]${tenantId}"  
+
+          # Set up Python virtual environment
+          - task: Bash@3
+            name: "setup_environment"
+            displayName: "Setup Python Environment"
+            inputs:
+              targetType: "inline"
+              script: |
+                echo "##[group]Setup Python Virtual Environment"
+                    python3 -m venv $(PATH_VENV)
+                    source $(PATH_VENV)/bin/activate
+                    pip install --upgrade pip
+                echo "##[endgroup]"
+
+          # Install Ansible collection
+          - task: Bash@3
+            name: "install_ansible_collection"
+            displayName: "Install Ansible Collection"
+            inputs:
+              targetType: "inline"
+              script: |
+                echo "##[group]Install the Azure Ansible Collection"
+                    ansible-galaxy collection install --force azure.azcollection
+                    ansible-galaxy collection list azure.azcollection
+                echo "##[endgroup]"
+    
+          # Cache virtual environment
+          - task: Cache@2
+            name: "cache_venv"
+            displayName: "Cache virtual environment"
+            inputs:
+              key: 'venv$(CACHE_VERSION) | "$(Agent.OS)" | $(PATH_COLLECTION)/$(REQUIREMENTS_FILE_NAME)'
+              path: $(PATH_VENV)
+              cacheHitVar: CACHE_RESTORED
+
+          # Install dependencies if cache miss
+          - task: Bash@3
+            name: "install_dependencies"
+            displayName: "Install Dependencies"
+            condition: ne(variables.CACHE_RESTORED, 'true')
+            inputs:
+              targetType: "inline"
+              script: |
+                echo "##[group]Install pip requirements"
+                    source $(PATH_VENV)/bin/activate
+                    pip install ansible[azure]
+                    ansible-galaxy collection install --force azure.azcollection
+                    pip install -r $(PATH_COLLECTION)/$(REQUIREMENTS_FILE_NAME)
+                    pip freeze > $(PATH_VENV)/$(REQUIREMENTS_FILE_NAME)
+                echo "##[endgroup]"
+
+          # Install SSH key for Ansible
+          - task: InstallSSHKey@0
+            displayName: "Add SSH Key"
+            inputs:
+              sshKeySecureFile: "id_rsa"
+              knownHostsEntry: "azure.devops"
+
+          # Run Ansible playbook
+          - task: Bash@3
+            name: "ansible"
+            displayName: "Run Ansible"
+            env:
+              AZURE_CLIENT_ID: $(ARM_CLIENT_ID)
+              AZURE_SECRET: $(ARM_CLIENT_SECRET)
+              AZURE_TENANT: $(ARM_TENANT_ID)
+              AZURE_SUBSCRIPTION_ID: $(ARM_SUBSCRIPTION_ID)
+              ANSIBLE_HOST_KEY_CHECKING: "False"
+            inputs:
+                targetType: "inline"
+                script: |
+                  echo "##[group]Add SSH key"
+                      echo "$(SSH_PUBLIC_KEY)" > ~/.ssh/id_rsa.pub
+                      chmod 644 ~/.ssh/id_rsa.pub
+                  echo "##[endgroup]"
+  
+                  echo "##[group]Verify Azure module installation"
+                      source $(PATH_VENV)/bin/activate
+                      python -c "import azure; print('Azure module is available')"
+                  echo "##[endgroup]"
+  
+                  echo "##[group]Run the Ansible Playbook"
+                      ansible-playbook -i inv site.yml 2>&1 | tee $(System.DefaultWorkingDirectory)/ansible_output.log
+                  echo "##[endgroup]"
+
+                  echo "##[group]Create the markdown file for the Ansible Playbook Output"
+                      mkdir -p $(System.DefaultWorkingDirectory)/markdown
+                      echo "# Ansible Playbook Output" > $(System.DefaultWorkingDirectory)/markdown/summary.md
+                      echo "<details><summary>Click to expand</summary>" >> $(System.DefaultWorkingDirectory)/markdown/summary.md
+                      echo "" >> $(System.DefaultWorkingDirectory)/markdown/summary.md
+                      echo "\`\`\`" >> $(System.DefaultWorkingDirectory)/markdown/summary.md
+                      cat $(System.DefaultWorkingDirectory)/ansible_output.log >> $(System.DefaultWorkingDirectory)/markdown/summary.md
+                      echo "\`\`\`" >> $(System.DefaultWorkingDirectory)/markdown/summary.md
+                      echo "</details>" >> $(System.DefaultWorkingDirectory)/markdown/summary.md
+                  echo "##[endgroup]"
+
+          # Publish Ansible output as markdown
+          - task: PublishMarkdownReports@1
+            name: "upload_ansible_output"
+            displayName: "Upload Ansible Output"
+            inputs:
+              contentPath: "$(Build.SourcesDirectory)/markdown"
+              indexFile: "summary.md"
